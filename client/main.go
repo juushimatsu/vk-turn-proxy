@@ -167,7 +167,7 @@ func (directNet) ResolveTCPAddr(network, address string) (*net.TCPAddr, error) {
 }
 
 func (directNet) Interfaces() ([]*transport.Interface, error) {
-	return nil, transport.ErrNotSupported
+	return nil, nil
 }
 
 func (directNet) InterfaceByIndex(index int) (*transport.Interface, error) {
@@ -204,6 +204,30 @@ type directTCPListener struct {
 
 func (l directTCPListener) AcceptTCP() (transport.TCPConn, error) {
 	return l.TCPListener.AcceptTCP()
+}
+
+func closeWithLog(closer io.Closer, msg string) {
+	if err := closer.Close(); err != nil {
+		log.Printf("%s: %v", msg, err)
+	}
+}
+
+func setDeadlineWithLog(conn interface{ SetDeadline(time.Time) error }, t time.Time, msg string) {
+	if err := conn.SetDeadline(t); err != nil {
+		log.Printf("%s: %v", msg, err)
+	}
+}
+
+func setReadDeadlineWithLog(conn interface{ SetReadDeadline(time.Time) error }, t time.Time, msg string) {
+	if err := conn.SetReadDeadline(t); err != nil {
+		log.Printf("%s: %v", msg, err)
+	}
+}
+
+func setWriteDeadlineWithLog(conn interface{ SetWriteDeadline(time.Time) error }, t time.Time, msg string) {
+	if err := conn.SetWriteDeadline(t); err != nil {
+		log.Printf("%s: %v", msg, err)
+	}
 }
 
 // region Helper: HTTP Headers Injection
@@ -448,9 +472,7 @@ func fetchCaptchaBootstrap(ctx context.Context, redirectURI string, client tlscl
 	if err != nil {
 		return nil, err
 	}
-	defer func(Body io.ReadCloser) {
-		_ = Body.Close()
-	}(resp.Body)
+	defer closeWithLog(resp.Body, "failed to close captcha bootstrap response body")
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -502,9 +524,7 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 		if err != nil {
 			return nil, err
 		}
-		defer func(Body io.ReadCloser) {
-			_ = Body.Close()
-		}(httpResp.Body)
+		defer closeWithLog(httpResp.Body, "failed to close response body")
 
 		body, err := io.ReadAll(httpResp.Body)
 		if err != nil {
@@ -858,11 +878,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 		if err != nil {
 			return nil, err
 		}
-		defer func() {
-			if closeErr := httpResp.Body.Close(); closeErr != nil {
-				log.Printf("close response body: %s", closeErr)
-			}
-		}()
+		defer closeWithLog(httpResp.Body, "failed to close VK API response body")
 
 		body, err := io.ReadAll(httpResp.Body)
 		if err != nil {
@@ -1234,11 +1250,7 @@ func getYandexCreds(link string) (string, string, string, error) {
 	if err != nil {
 		return "", "", "", err
 	}
-	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			log.Printf("close response body: %s", closeErr)
-		}
-	}()
+	defer closeWithLog(resp.Body, "failed to close conference response body")
 	if resp.StatusCode != http.StatusOK {
 		readBody, err2 := io.ReadAll(resp.Body)
 		if err2 != nil {
@@ -1269,18 +1281,14 @@ func getYandexCreds(link string) (string, string, string, error) {
 	conn, resp, err = dialer.DialContext(ctx, data.Wss, h)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
+			closeWithLog(resp.Body, "failed to close conference response body")
 		}
 		return "", "", "", fmt.Errorf("ws dial: %w", err)
 	}
 	if resp != nil && resp.Body != nil {
-		defer func() { _ = resp.Body.Close() }()
+		defer closeWithLog(resp.Body, "failed to close conference response body")
 	}
-	defer func() {
-		if closeErr := conn.Close(); closeErr != nil {
-			log.Printf("close websocket: %s", closeErr)
-		}
-	}()
+	defer closeWithLog(conn, "failed to close websocket connection")
 
 	req1 := HelloRequest{
 		UID: uuid.New().String(),
@@ -1352,9 +1360,7 @@ func getYandexCreds(link string) (string, string, string, error) {
 		return "", "", "", fmt.Errorf("ws write: %w", err)
 	}
 
-	if err := conn.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
-		return "", "", "", fmt.Errorf("ws set read deadline: %w", err)
-	}
+	setReadDeadlineWithLog(conn, time.Now().Add(15*time.Second), "failed to set websocket read deadline")
 
 	for {
 		_, msg, err := conn.ReadMessage()
@@ -1570,12 +1576,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 			err = fmt.Errorf("failed to connect to TURN server: %s", err2)
 			return
 		}
-		defer func() {
-			if err1 = conn.Close(); err1 != nil {
-				err = fmt.Errorf("failed to close TURN server connection: %s", err1)
-				return
-			}
-		}()
+		defer closeWithLog(conn, "failed to close TURN server connection")
 		turnConn = &connectedUDPConn{conn}
 	} else {
 		conn, err2 := d.DialContext(ctx1, "tcp", turnServerAddr)
@@ -1583,12 +1584,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 			err = fmt.Errorf("failed to connect to TURN server: %s", err2)
 			return
 		}
-		defer func() {
-			if err1 = conn.Close(); err1 != nil {
-				err = fmt.Errorf("failed to close TURN server connection: %s", err1)
-				return
-			}
-		}()
+		defer closeWithLog(conn, "failed to close TURN server connection")
 		turnConn = turn.NewSTUNConn(conn)
 	}
 	var addrFamily turn.RequestedAddressFamily
@@ -1638,9 +1634,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	connectedStreams.Add(1)
 	defer func() {
 		connectedStreams.Add(-1)
-		if err1 := relayConn.Close(); err1 != nil {
-			err = fmt.Errorf("failed to close TURN allocated connection: %s", err1)
-		}
+		closeWithLog(relayConn, "failed to close TURN allocated connection")
 	}()
 
 	if isDebug {
